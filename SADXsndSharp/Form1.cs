@@ -502,6 +502,8 @@ namespace SADXsndSharp
 
 		internal static class Compress
 		{
+			const int COMP_HEADER_LEN = 20;
+
 			const uint SLIDING_LEN = 0x1000;
 			const uint SLIDING_MASK = 0xFFF;
 
@@ -511,7 +513,7 @@ namespace SADXsndSharp
 			//TODO: Documentation
 			struct OffsetLengthPair
 			{
-				public byte highByte, lowByte;
+				private byte highByte, lowByte;
 
 				//TODO: Set
 				public int Offset
@@ -530,6 +532,13 @@ namespace SADXsndSharp
 						return (lowByte & NIBBLE_LOW) + 3;
 					}
 				}
+
+				public OffsetLengthPair(Stream stream)
+				{
+					//TODO: Add exceptions
+					highByte = (byte)stream.ReadByte();
+					lowByte = (byte)stream.ReadByte();
+				}
 			}
 
 			//TODO: Documentation
@@ -538,39 +547,42 @@ namespace SADXsndSharp
 				private byte flags;
 				private byte mask;
 
-				// TODO: Documentation
-				public bool ReadFlag(out bool flag)
-				{
-					bool endOfHeader = mask != 0x00;
+				private Stream stream;
 
-					flag = (flags & mask) != 0;
+				// TODO: Documentation
+				public bool ReadFlag()
+				{
+					if (mask == 0x00)
+					{
+						// TODO: Add exceptions
+						flags = (byte)stream.ReadByte();
+						mask = 0x01;
+					}
+
+					bool flag = (flags & mask) != 0;
 
 					mask <<= 1;
-					return endOfHeader;
+					return flag;
 				}
 
-				public ChunkHeader(byte flags)
+				public ChunkHeader(Stream stream)
 				{
-					this.flags = flags;
-					this.mask = 0x01;
+					flags = 0x00;
+					mask = 0x00;
+					this.stream = stream;
 				}
 			}
 
 			//TODO:
-			private static void CompressBuffer(byte[] compBuf, byte[] decompBuf /*Starting at + 20*/)
+			private static void CompressBuffer(Stream compStream, Stream decompStream /*Starting at + 20*/)
 			{
 
 			}
 
 			// Decompresses a Lempel-Ziv buffer.
 			// TODO: Add documentation
-			private static void DecompressBuffer(byte[] decompBuf, byte[] compBuf /*Starting at + 20*/)
+			private static void DecompressBuffer(Stream decompStream, Stream compStream /*Starting at + 20*/)
 			{
-				OffsetLengthPair olPair = new OffsetLengthPair();
-
-				int compBufPtr = 0;
-				int decompBufPtr = 0;
-
 				//Create sliding dictionary buffer and clear first 4078 bytes of dictionary buffer to 0
 				byte[] slidingDict = new byte[SLIDING_LEN];
 
@@ -578,27 +590,20 @@ namespace SADXsndSharp
 				uint dictInsertionOffset = SLIDING_LEN - 18;
 
 				// Current chunk header
-				ChunkHeader chunkHeader = new ChunkHeader();
+				ChunkHeader chunkHeader = new ChunkHeader(compStream);
 
-				while (decompBufPtr < decompBuf.Length)
+				while (decompStream.Position < decompStream.Length)
 				{
-					// At the start of each chunk...
-					if (!chunkHeader.ReadFlag(out bool flag))
-					{
-						// Load the chunk header
-						chunkHeader = new ChunkHeader(compBuf[compBufPtr++]);
-						chunkHeader.ReadFlag(out flag);
-					}
-
 					// Each chunk header is a byte and is a collection of 8 flags
 
 					// If the flag is set, load a character
-					if (flag)
+					if (chunkHeader.ReadFlag())
 					{
 						// Copy the character
-						byte rawByte = compBuf[compBufPtr++];
-						decompBuf[decompBufPtr++] = rawByte;
-
+						// TODO: Add exceptions
+						byte rawByte = (byte)compStream.ReadByte();
+						
+						decompStream.WriteByte(rawByte);
 						// Add the character to the dictionary, and slide the dictionary
 						slidingDict[dictInsertionOffset++] = rawByte;
 						dictInsertionOffset &= SLIDING_MASK;
@@ -608,9 +613,7 @@ namespace SADXsndSharp
 					else
 					{
 						// Load the offset/length pair
-						olPair.highByte = compBuf[compBufPtr++];
-						olPair.lowByte = compBuf[compBufPtr++];
-
+						OffsetLengthPair olPair = new OffsetLengthPair(compStream);
 						// Get the offset from the offset/length pair
 						int offset = olPair.Offset;
 
@@ -620,9 +623,9 @@ namespace SADXsndSharp
 						for (int i = 0; i < length; i++)
 						{
 							byte rawByte = slidingDict[(offset + i) & SLIDING_MASK];
-							decompBuf[decompBufPtr++] = rawByte;
+							decompStream.WriteByte(rawByte);
 
-							if (decompBufPtr >= decompBuf.Length) return;
+							if (decompStream.Position >= decompStream.Length) return;
 
 							// Add the character to the dictionary, and slide the dictionary
 							slidingDict[dictInsertionOffset++] = rawByte;
@@ -642,21 +645,25 @@ namespace SADXsndSharp
 				if (isFileCompressed(CompressedBuffer))
 				{
 					uint DecompressedSize = BitConverter.ToUInt32(CompressedBuffer, 16);
-					byte[] DecompressedBuffer = new byte[DecompressedSize];
+					
 					//Xor Decrypt the whole buffer
 					byte XorEncryptionValue = CompressedBuffer[15];
 
-					byte[] CompBuf = new byte[CompressedBuffer.Length - 20];
-					for (int i = 20; i < CompressedBuffer.Length; i++)
+					using (MemoryStream compStream = new MemoryStream(new byte[CompressedBuffer.Length - COMP_HEADER_LEN], true),
+						decompStream = new MemoryStream(new byte[DecompressedSize], true))
 					{
-						CompBuf[i - 20] = (byte)(CompressedBuffer[i] ^ XorEncryptionValue);
+						for (int i = COMP_HEADER_LEN; i < CompressedBuffer.Length; i++)
+						{
+							compStream.WriteByte((byte)(CompressedBuffer[i] ^ XorEncryptionValue));
+						}
+
+						compStream.Seek(0, SeekOrigin.Begin);
+
+						//Decompress the whole buffer
+						DecompressBuffer(decompStream, compStream);
+						//Switch the buffers around so the decompressed one gets saved instead
+						return decompStream.ToArray();
 					}
-
-					//Decompress the whole buffer
-					DecompressBuffer(DecompressedBuffer, CompBuf);
-
-					//Switch the buffers around so the decompressed one gets saved instead
-					return DecompressedBuffer;
 				}
 				else
 				{
